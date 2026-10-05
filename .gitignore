@@ -1,0 +1,29 @@
+# 打包产物 / Build artifacts
+split_color_bw_portable.exe
+split_color_bw_unportable/
+
+# 输出目录 / Output directory
+export/
+
+# Python 缓存 / Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# 临时文件 / Temp files
+*.tmp
+*.bak
+*.swp
+*~
+
+# 系统文件 / OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE / .vscode
+.idea/
+.vscode/
+*.suo
+*.user

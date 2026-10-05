@@ -245,46 +245,53 @@ def process_document(src, out_bw, out_color):
     fitz = get_fitz()
     doc_bw = fitz.open(src)
     doc_color = fitz.open(src)
-    total = doc_bw.page_count
-    stats, modes = [], {}
+    try:
+        total = doc_bw.page_count
+        stats, modes = [], {}
 
-    for i in range(total):
-        pb, pc = doc_bw[i], doc_color[i]
-        if MODE == "raster":
-            st, tag = page_raster(pb, pc), "像素"
-        else:
-            c_rects, b_rects, ratio = collect_objects(doc_bw, pb)
-            if MODE == "auto" and ratio > SCAN_RATIO:
-                st, tag = page_raster(pb, pc), "像素(扫描页)"
+        for i in range(total):
+            pb, pc = doc_bw[i], doc_color[i]
+            if MODE == "raster":
+                st, tag = page_raster(pb, pc), "像素"
             else:
-                st, tag = page_vector(pb, pc, c_rects, b_rects), "矢量"
-        stats.append(st)
-        modes[tag] = modes.get(tag, 0) + 1
-        sys.stdout.write("\r    进度: %d/%d 页 [%s]" % (i + 1, total, tag))
-        sys.stdout.flush()
-    sys.stdout.write("\n")
+                c_rects, b_rects, ratio = collect_objects(doc_bw, pb)
+                if MODE == "auto" and ratio > SCAN_RATIO:
+                    st, tag = page_raster(pb, pc), "像素(扫描页)"
+                else:
+                    st, tag = page_vector(pb, pc, c_rects, b_rects), "矢量"
+            stats.append(st)
+            modes[tag] = modes.get(tag, 0) + 1
+            sys.stdout.write("\r    进度: %d/%d 页 [%s]" % (i + 1, total, tag))
+            sys.stdout.flush()
+        sys.stdout.write("\n")
 
-    doc_bw.save(out_bw, garbage=4, deflate=True)
-    doc_color.save(out_color, garbage=4, deflate=True)
-    doc_bw.close()
-    doc_color.close()
-    return stats, modes
+        doc_bw.save(out_bw, garbage=4, deflate=True)
+        doc_color.save(out_color, garbage=4, deflate=True)
+        return stats, modes
+    finally:
+        doc_bw.close()
+        doc_color.close()
 
 
 # ---------------- Word 转 PDF ----------------
 def word_to_pdf(src, out_dir):
     src_abs = os.path.abspath(src)
     out_pdf = os.path.join(out_dir, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+    co_initialized = False
     try:
         import win32com.client as win32
         try:
             import pythoncom
             pythoncom.CoInitialize()
+            co_initialized = True
         except Exception:
             pass
         for app_name in ("KWps.Application", "Word.Application"):
+            app = None
+            doc = None
             try:
-                app = win32.Dispatch(app_name)
+                # DispatchEx 始终创建新实例，避免连接到用户已运行的窗口并将其隐藏
+                app = win32.DispatchEx(app_name)
             except Exception:
                 continue
             try:
@@ -292,16 +299,31 @@ def word_to_pdf(src, out_dir):
                 doc = app.Documents.Open(src_abs, ReadOnly=True)
                 doc.SaveAs2(out_pdf, FileFormat=17)
                 doc.Close(False)
+                doc = None
                 app.Quit()
+                app = None
                 if os.path.exists(out_pdf):
                     return out_pdf
             except Exception:
-                try:
-                    app.Quit()
-                except Exception:
-                    pass
+                if doc is not None:
+                    try:
+                        doc.Close(False)
+                    except Exception:
+                        pass
+                if app is not None:
+                    try:
+                        app.Quit()
+                    except Exception:
+                        pass
     except Exception:
         pass
+    finally:
+        if co_initialized:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
     for cand in (shutil.which("soffice"),
                  r"C:\Program Files\LibreOffice\program\soffice.exe"):
         if cand and os.path.exists(cand):
@@ -381,58 +403,58 @@ def main():
     out_dir = os.path.join(base, EXPORT)
     os.makedirs(out_dir, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="bwcolor_")
+    try:
+        print("[2/3] 扫描目录：%s （模式：%s）" % (base, MODE))
+        items = collect_files(base)
+        if not items:
+            report_empty(base)
+            return
 
-    print("[2/3] 扫描目录：%s （模式：%s）" % (base, MODE))
-    items = collect_files(base)
-    if not items:
-        report_empty(base)
+        print("      共发现 %d 个文件" % len(items))
+        print("[3/3] 开始处理 ...")
+
+        all_stats = []
+        for path, rel in items:
+            stem = os.path.splitext(rel)[0].replace(os.sep, "_").replace("/", "_")
+            print("  -> %s" % rel)
+            work = path
+            if path.lower().endswith((".doc", ".docx")):
+                work = word_to_pdf(path, tmp)
+                if not work:
+                    print("     [跳过] Word 转 PDF 失败")
+                    continue
+            t0 = time.time()
+            try:
+                out_bw = unique_path(os.path.join(out_dir, stem + "_黑白.pdf"))
+                out_color = unique_path(os.path.join(out_dir, stem + "_彩色.pdf"))
+                stats, modes = process_document(work, out_bw, out_color)
+                avg = sum(stats) / len(stats) if stats else 0
+                all_stats.append((rel, len(stats), avg, stats))
+                print("     完成 %.1f 秒，%d 页 [%s]，平均彩色占比 %.1f%%"
+                      % (time.time() - t0, len(stats),
+                         " ".join("%s×%d" % (k, v) for k, v in modes.items()), avg))
+            except Exception as e:
+                print("     [失败] %s" % e)
+
+        if all_stats:
+            now = datetime.datetime.now()
+            rep = unique_path(os.path.join(
+                out_dir, now.strftime("%Y年%m月%d日%H时%M分") + "_统计报告.csv"))
+            with open(rep, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["生成时间", now.strftime("%Y-%m-%d %H:%M:%S")])
+                w.writerow(["扫描目录", base])
+                w.writerow(["处理模式", MODE])
+                w.writerow([])
+                w.writerow(["文件名", "页码", "彩色占比%", "黑白占比%"])
+                for rel, _, _, stats in all_stats:
+                    for i, r in enumerate(stats, 1):
+                        w.writerow([rel, i, "%.2f" % r, "%.2f" % (100 - r)])
+            print("\n统计报告：%s" % rep)
+
+        print("全部完成，结果见 %s 文件夹。" % EXPORT)
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        return
-
-    print("      共发现 %d 个文件" % len(items))
-    print("[3/3] 开始处理 ...")
-
-    all_stats = []
-    for path, rel in items:
-        stem = os.path.splitext(rel)[0].replace(os.sep, "_").replace("/", "_")
-        print("  -> %s" % rel)
-        work = path
-        if path.lower().endswith((".doc", ".docx")):
-            work = word_to_pdf(path, tmp)
-            if not work:
-                print("     [跳过] Word 转 PDF 失败")
-                continue
-        t0 = time.time()
-        try:
-            out_bw = unique_path(os.path.join(out_dir, stem + "_黑白.pdf"))
-            out_color = unique_path(os.path.join(out_dir, stem + "_彩色.pdf"))
-            stats, modes = process_document(work, out_bw, out_color)
-            avg = sum(stats) / len(stats) if stats else 0
-            all_stats.append((rel, len(stats), avg, stats))
-            print("     完成 %.1f 秒，%d 页 [%s]，平均彩色占比 %.1f%%"
-                  % (time.time() - t0, len(stats),
-                     " ".join("%s×%d" % (k, v) for k, v in modes.items()), avg))
-        except Exception as e:
-            print("     [失败] %s" % e)
-
-    if all_stats:
-        now = datetime.datetime.now()
-        rep = unique_path(os.path.join(
-            out_dir, now.strftime("%Y年%m月%d日%H时%M分") + "_统计报告.csv"))
-        with open(rep, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow(["生成时间", now.strftime("%Y-%m-%d %H:%M:%S")])
-            w.writerow(["扫描目录", base])
-            w.writerow(["处理模式", MODE])
-            w.writerow([])
-            w.writerow(["文件名", "页码", "彩色占比%", "黑白占比%"])
-            for rel, _, _, stats in all_stats:
-                for i, r in enumerate(stats, 1):
-                    w.writerow([rel, i, "%.2f" % r, "%.2f" % (100 - r)])
-        print("\n统计报告：%s" % rep)
-
-    shutil.rmtree(tmp, ignore_errors=True)
-    print("全部完成，结果见 %s 文件夹。" % EXPORT)
 
 
 if __name__ == "__main__":
